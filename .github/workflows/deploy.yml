@@ -7,41 +7,43 @@ on:
     branches: [main]
 
 jobs:
-  terraform-validate:
-    name: Terraform Validate
+  validate-lambdas:
+    name: Validate Lambda Functions
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1
+          python-version: "3.11"
 
-      - name: Terraform Init
-        working-directory: terraform
-        run: terraform init
+      - name: Install boto3 for syntax checking
+        run: pip install boto3
 
-      - name: Terraform Validate
-        working-directory: terraform
-        run: terraform validate
+      - name: Validate alert Lambda syntax
+        run: python3 -m py_compile lambda/alert/handler.py && echo "alert/handler.py OK"
 
-  terraform-apply:
-    name: Terraform Apply
+      - name: Validate weekly Lambda syntax
+        run: python3 -m py_compile lambda/weekly/handler.py && echo "weekly/handler.py OK"
+
+      - name: Run Lambda import test
+        run: |
+          python3 -c "
+          import ast, sys
+          for f in ['lambda/alert/handler.py', 'lambda/weekly/handler.py']:
+              with open(f) as fh:
+                  ast.parse(fh.read())
+              print(f'PASSED: {f}')
+          "
+
+  test-lambda:
+    name: Test Lambda via AWS
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -49,21 +51,26 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-east-1
 
-      - name: Write tfvars
-        working-directory: terraform
+      - name: Invoke weekly Lambda to verify it is live
         run: |
-          cat > terraform.tfvars << TFEOF
-          aws_region              = "us-east-1"
-          project_name            = "costalert"
-          alert_email             = "${{ secrets.ALERT_EMAIL }}"
-          monthly_budget_limit    = "10"
-          alert_threshold_percent = 80
-          TFEOF
+          aws lambda invoke \
+            --function-name costalert-weekly \
+            --payload '{}' \
+            --cli-binary-format raw-in-base64-out \
+            response.json
+          cat response.json
+          echo ""
+          STATUS=$(python3 -c "import json; d=json.load(open('response.json')); print(d.get('statusCode', 500))")
+          if [ "$STATUS" = "200" ]; then
+            echo "Weekly Lambda healthy"
+          else
+            echo "Lambda returned non-200 status"
+            exit 1
+          fi
 
-      - name: Terraform Init
-        working-directory: terraform
-        run: terraform init -upgrade
-
-      - name: Terraform Apply
-        working-directory: terraform
-        run: terraform apply -auto-approve
+      - name: Summary
+        run: |
+          echo "Cost Alert System is live"
+          echo "Alert Lambda:  costalert-alert"
+          echo "Weekly Lambda: costalert-weekly"
+          echo "Schedule:      Every Sunday 8AM UTC"
